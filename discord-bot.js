@@ -2,7 +2,7 @@ import {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle, InteractionType,
-  Events, ActivityType,
+  Events, ActivityType, StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
 } from "discord.js";
 import mineflayer from "mineflayer";
 import fs from "fs";
@@ -11,8 +11,11 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(__dirname, "discord-slots.json");
+const MAX_SLOTS_PER_USER = parseInt(process.env.MAX_SLOTS_PER_USER || "5");
+const ADMIN_ID = process.env.DISCORD_ADMIN_ID || null;
 
 // ─── Persistence ───────────────────────────────────────────────────────────────
+// db[userId][slotNum] = { host, port, version, username, password, registered }
 function loadData() {
   try { if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8")); } catch {}
   return {};
@@ -20,26 +23,43 @@ function loadData() {
 function saveData(d) { try { fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2)); } catch {} }
 
 let db = loadData();
-// db[userId] = { host, port, version, username, password, registered, discordChannel }
 
-function getUser(userId) { return db[userId] ?? null; }
-function setUser(userId, data) { db[userId] = data; saveData(db); }
-function deleteUser(userId) { delete db[userId]; saveData(db); }
+function getUserSlots(userId) { return db[userId] ?? {}; }
+function getSlot(userId, slotNum) { return db[userId]?.[String(slotNum)] ?? null; }
+function setSlot(userId, slotNum, data) {
+  if (!db[userId]) db[userId] = {};
+  db[userId][String(slotNum)] = data;
+  saveData(db);
+}
+function deleteSlot(userId, slotNum) {
+  if (db[userId]) { delete db[userId][String(slotNum)]; if (!Object.keys(db[userId]).length) delete db[userId]; }
+  saveData(db);
+}
+function getUserSlotCount(userId) { return Object.keys(db[userId] ?? {}).length; }
+function getNextSlotNum(userId) {
+  const slots = db[userId] ?? {};
+  for (let i = 1; i <= 100; i++) { if (!slots[String(i)]) return i; }
+  return null;
+}
 
 // ─── Bot Instances ─────────────────────────────────────────────────────────────
-const bots = new Map(); // userId -> { bot, reconnectTimer, afkTimer, shouldReconnect, isReconnecting, destroyed }
+// key = `${userId}_${slotNum}`
+const bots = new Map();
 
-function freshState(userId) {
-  return { userId, bot: null, reconnectTimer: null, afkTimer: null, shouldReconnect: false, isReconnecting: false, destroyed: true };
+function botKey(userId, slotNum) { return `${userId}_${slotNum}`; }
+
+function freshState(userId, slotNum) {
+  return { userId, slotNum, bot: null, reconnectTimer: null, afkTimer: null, shouldReconnect: false, isReconnecting: false, destroyed: true };
 }
 
-function getState(userId) {
-  if (!bots.has(userId)) bots.set(userId, freshState(userId));
-  return bots.get(userId);
+function getState(userId, slotNum) {
+  const key = botKey(userId, slotNum);
+  if (!bots.has(key)) bots.set(key, freshState(userId, slotNum));
+  return bots.get(key);
 }
 
-function isOnline(userId) { return !!(getState(userId).bot?.entity); }
-function isReconnecting(userId) { return getState(userId).isReconnecting; }
+function isOnline(userId, slotNum) { return !!(getState(userId, slotNum).bot?.entity); }
+function isRecon(userId, slotNum) { return getState(userId, slotNum).isReconnecting; }
 
 function stopAfk(state) { if (state.afkTimer) { clearInterval(state.afkTimer); state.afkTimer = null; } }
 function startAfk(state) {
@@ -64,172 +84,209 @@ function destroyBot(state) {
   try { b?.end?.(); } catch {}
 }
 
-function scheduleReconnect(state, delayMs) {
+function scheduleReconnect(state, client, delayMs) {
   cancelReconnect(state);
   if (!state.shouldReconnect) return;
   state.isReconnecting = true;
   const delay = delayMs ?? (7000 + Math.random() * 5000);
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
-    if (state.shouldReconnect) { const d = getUser(state.userId); if (d) launchBot(state.userId, d); }
+    if (state.shouldReconnect) {
+      const d = getSlot(state.userId, state.slotNum);
+      if (d) launchBot(state.userId, state.slotNum, d, client);
+    }
   }, delay);
 }
 
-// ─── Log to Discord DM ─────────────────────────────────────────────────────────
-async function logToDiscord(client, userId, msg) {
-  try {
-    const user = await client.users.fetch(userId).catch(() => null);
-    if (user) await user.send({ content: `\`[MC Log]\` ${msg}` }).catch(() => {});
-  } catch {}
+async function dmUser(client, userId, msg) {
+  try { const u = await client.users.fetch(userId).catch(() => null); if (u) await u.send({ content: msg }).catch(() => {}); } catch {}
 }
 
-// ─── Launch Mineflayer Bot ─────────────────────────────────────────────────────
-function launchBot(userId, cfg, client) {
-  const state = getState(userId);
+// ─── Launch Bot ────────────────────────────────────────────────────────────────
+function launchBot(userId, slotNum, cfg, client) {
+  const state = getState(userId, slotNum);
   state.destroyed = false;
-
-  const b = mineflayer.createBot({
-    host: cfg.host, port: Number(cfg.port), username: cfg.username,
-    version: cfg.version || "1.21", auth: "offline", hideErrors: false,
-  });
+  const b = mineflayer.createBot({ host: cfg.host, port: Number(cfg.port), username: cfg.username, version: cfg.version || "1.21", auth: "offline", hideErrors: false });
   state.bot = b;
 
   b.once("spawn", () => {
     if (b !== state.bot) return;
     state.isReconnecting = false;
-    if (client) logToDiscord(client, userId, `✅ Joined **${cfg.host}:${cfg.port}** as **${cfg.username}**`);
+    if (client) dmUser(client, userId, `\`[Slot ${slotNum}]\` ✅ **${cfg.username}** joined **${cfg.host}:${cfg.port}**`);
     startAfk(state);
     if (cfg.password) setTimeout(() => { if (b !== state.bot) return; try { b.chat(`/login ${cfg.password}`); } catch {} }, 1500);
   });
 
   b.on("chat", (username, message) => {
     if (b !== state.bot || username === b.username) return;
-    if (client) logToDiscord(client, userId, `💬 **${username}**: ${message}`);
+    if (client) dmUser(client, userId, `\`[Slot ${slotNum}]\` 💬 **${username}**: ${message}`);
   });
 
   b.on("message", (jsonMsg) => {
     if (b !== state.bot) return;
-    const raw = jsonMsg.toString();
-    const lower = raw.toLowerCase();
+    const raw = jsonMsg.toString(); const lower = raw.toLowerCase();
     if (cfg.password) {
       if (lower.includes("/register") || lower.includes("please register")) { setTimeout(() => { if (b !== state.bot) return; try { b.chat(`/register ${cfg.password} ${cfg.password}`); } catch {} }, 800); return; }
       if (lower.includes("/login") || lower.includes("please login")) { setTimeout(() => { if (b !== state.bot) return; try { b.chat(`/login ${cfg.password}`); } catch {} }, 800); return; }
     }
   });
 
-  b.on("error", (err) => { if (b !== state.bot) return; if (client) logToDiscord(client, userId, `⚠️ Error: ${err.message}`); });
+  b.on("error", (err) => { if (b !== state.bot) return; if (client) dmUser(client, userId, `\`[Slot ${slotNum}]\` ⚠️ ${err.message}`); });
 
   b.on("kicked", (reason) => {
     if (b !== state.bot) return;
     let msg = reason; try { msg = JSON.parse(reason)?.text ?? reason; } catch {}
-    if (client) logToDiscord(client, userId, `❌ Kicked: ${msg}`);
+    if (client) dmUser(client, userId, `\`[Slot ${slotNum}]\` ❌ Kicked: ${msg}`);
     destroyBot(state);
-    scheduleReconnect(state, msg.toLowerCase().includes("already") ? 30000 : undefined);
+    scheduleReconnect(state, client, msg.toLowerCase().includes("already") ? 30000 : undefined);
   });
 
   b.on("end", (reason) => {
     if (b !== state.bot) return;
-    if (client) logToDiscord(client, userId, `🔄 Disconnected (${reason ?? "unknown"}). Reconnecting...`);
-    destroyBot(state);
-    scheduleReconnect(state, undefined);
+    if (client) dmUser(client, userId, `\`[Slot ${slotNum}]\` 🔄 Disconnected. Reconnecting...`);
+    destroyBot(state); scheduleReconnect(state, client);
   });
 }
 
-// ─── Action Helpers ────────────────────────────────────────────────────────────
-function startUserBot(userId, client) {
-  const d = getUser(userId);
+function startBot(userId, slotNum, client) {
+  const d = getSlot(userId, slotNum);
   if (!d?.registered || !d?.host) return false;
-  const state = getState(userId);
+  const state = getState(userId, slotNum);
   state.shouldReconnect = false; cancelReconnect(state); destroyBot(state);
   state.shouldReconnect = true; state.isReconnecting = false; state.destroyed = false;
-  launchBot(userId, d, client);
+  launchBot(userId, slotNum, d, client);
   return true;
 }
 
-function stopUserBot(userId) {
-  const state = getState(userId);
+function stopBot(userId, slotNum) {
+  const state = getState(userId, slotNum);
   state.shouldReconnect = false; state.isReconnecting = false;
   cancelReconnect(state); destroyBot(state);
 }
 
-function restartUserBot(userId, client) {
-  stopUserBot(userId);
-  setTimeout(() => startUserBot(userId, client), 2000);
+function restartBot(userId, slotNum, client) {
+  stopBot(userId, slotNum);
+  setTimeout(() => startBot(userId, slotNum, client), 2000);
 }
 
 // ─── Embed Builders ────────────────────────────────────────────────────────────
 function buildMainEmbed() {
-  const totalUsers = Object.keys(db).length;
-  const online = [...bots.values()].filter(s => s.bot?.entity).length;
-  const reconnecting = [...bots.values()].filter(s => s.isReconnecting).length;
-  const slots = parseInt(process.env.MAX_SLOTS || "100");
-
+  let totalOnline = 0, totalSlots = 0;
+  for (const [key, state] of bots) { if (state.bot?.entity) totalOnline++; }
+  for (const uid of Object.keys(db)) { totalSlots += Object.keys(db[uid]).length; }
   return new EmbedBuilder()
-    .setTitle("🎮 AFK Bot Control Panel")
-    .setDescription("Manage your personal AFK bot using the buttons below.\n\n• Secure backend system\n• Auto reconnect support\n• One bot per user\n• Role Required to Use Panel.")
+    .setTitle("🎮 MC AFK Bot Control Panel")
+    .setDescription("Manage your personal Minecraft AFK bots!\n\n• Multiple bot slots per user\n• Auto reconnect support\n• Live DM updates\n• Secure — only you control your bots")
     .addFields(
       { name: "System Status 📊", value: "🟢 Online", inline: true },
-      { name: "Active Bots 🤖", value: String(online + reconnecting), inline: true },
-      { name: "Available Slots 🔌", value: String(Math.max(0, slots - totalUsers)), inline: true },
+      { name: "Active Bots 🤖", value: String(totalOnline), inline: true },
+      { name: "Total Slots 🔌", value: String(totalSlots), inline: true },
     )
     .setColor(0x5865F2)
     .setFooter({ text: "MC AFK Bot Panel • Made by King Khizar" })
     .setTimestamp();
 }
 
-function buildUserEmbed(userId) {
-  const d = getUser(userId);
-  const online = isOnline(userId);
-  const recon = isReconnecting(userId);
-  const state = getState(userId);
-  const players = online ? Object.values(state.bot?.players ?? {}).map(p => p.username) : [];
-
-  const statusStr = online ? "🟢 Online" : recon ? "🟡 Reconnecting..." : "🔴 Offline";
-
+function buildSlotsEmbed(userId) {
+  const slots = getUserSlots(userId);
+  const entries = Object.entries(slots);
   const embed = new EmbedBuilder()
-    .setTitle(`⛏ Your Bot — Slot`)
+    .setTitle(`⛏ Your Bot Slots`)
+    .setColor(0x5865F2)
+    .setFooter({ text: `${entries.length}/${MAX_SLOTS_PER_USER} slots used • Made by King Khizar` })
+    .setTimestamp();
+
+  if (!entries.length) {
+    embed.setDescription("You have no slots yet!\nClick **➕ New Slot** to create your first bot.");
+  } else {
+    const lines = entries.map(([num, d]) => {
+      const online = isOnline(userId, num);
+      const recon = isRecon(userId, num);
+      const status = online ? "🟢" : recon ? "🟡" : "🔴";
+      return `${status} **Slot ${num}** — \`${d.username}\` @ \`${d.host}:${d.port || 25565}\``;
+    });
+    embed.setDescription(lines.join("\n"));
+  }
+  return embed;
+}
+
+function buildSlotEmbed(userId, slotNum) {
+  const d = getSlot(userId, slotNum);
+  const online = isOnline(userId, slotNum);
+  const recon = isRecon(userId, slotNum);
+  const state = getState(userId, slotNum);
+  const players = online ? Object.values(state.bot?.players ?? {}).map(p => p.username) : [];
+  const statusStr = online ? "🟢 Online" : recon ? "🟡 Reconnecting..." : "🔴 Offline";
+  const embed = new EmbedBuilder()
+    .setTitle(`⛏ Slot ${slotNum} Control Panel`)
     .setColor(online ? 0x3ba55c : recon ? 0xfaa81a : 0xed4245)
     .setFooter({ text: "MC AFK Bot Panel • Made by King Khizar" })
     .setTimestamp();
-
   if (d?.registered) {
     embed.addFields(
       { name: "Status", value: statusStr, inline: true },
-      { name: "Players Online", value: online ? String(players.length) : "—", inline: true },
+      { name: "Players", value: online ? String(players.length) : "—", inline: true },
       { name: "Server", value: `${d.host}:${d.port || 25565}`, inline: true },
       { name: "Username", value: d.username, inline: true },
       { name: "Version", value: d.version || "1.21", inline: true },
       { name: "Auth", value: d.password ? "AuthMe ✅" : "None", inline: true },
     );
-    if (online && players.length > 0) embed.addFields({ name: "Online Players", value: players.slice(0, 10).join(", "), inline: false });
+    if (online && players.length) embed.addFields({ name: "Online Players", value: players.slice(0, 15).join(", "), inline: false });
   } else {
-    embed.setDescription("You haven't registered yet.\nClick **Register** to set up your Minecraft bot.");
+    embed.setDescription("This slot is not configured.\nClick **📝 Register** to set it up.");
   }
   return embed;
 }
 
-function botControlRow(userId) {
-  const d = getUser(userId);
-  const online = isOnline(userId);
+function mainRow(userId) {
+  const count = getUserSlotCount(userId);
+  const canAdd = count < MAX_SLOTS_PER_USER;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`newslot_${userId}`).setLabel("➕ New Slot").setStyle(ButtonStyle.Success).setDisabled(!canAdd),
+    new ButtonBuilder().setCustomId(`myslots_${userId}`).setLabel("📋 My Slots").setStyle(ButtonStyle.Primary),
+  );
+}
+
+function slotsSelectMenu(userId) {
+  const slots = getUserSlots(userId);
+  const entries = Object.entries(slots);
+  if (!entries.length) return null;
+  const options = entries.map(([num, d]) => {
+    const online = isOnline(userId, num);
+    const recon = isRecon(userId, num);
+    const emoji = online ? "🟢" : recon ? "🟡" : "🔴";
+    return new StringSelectMenuOptionBuilder()
+      .setLabel(`Slot ${num} — ${d.username}`)
+      .setDescription(`${d.host}:${d.port || 25565} | ${online ? "Online" : recon ? "Reconnecting" : "Offline"}`)
+      .setValue(`selectslot_${userId}_${num}`)
+      .setEmoji(emoji);
+  });
+  const menu = new StringSelectMenuBuilder().setCustomId(`slotmenu_${userId}`).setPlaceholder("Select a slot to manage...").addOptions(options);
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function slotControlRow1(userId, slotNum) {
+  const d = getSlot(userId, slotNum);
+  const online = isOnline(userId, slotNum);
   const registered = d?.registered ?? false;
-
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`register_${userId}`).setLabel("Register").setStyle(ButtonStyle.Primary).setEmoji("📝"),
-    new ButtonBuilder().setCustomId(`start_${userId}`).setLabel("Start Bot").setStyle(ButtonStyle.Success).setEmoji("▶").setDisabled(!registered),
-    new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel("Stop Bot").setStyle(ButtonStyle.Danger).setEmoji("⏹").setDisabled(!online),
+    new ButtonBuilder().setCustomId(`reg_${userId}_${slotNum}`).setLabel("📝 Register").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`startbot_${userId}_${slotNum}`).setLabel("▶ Start").setStyle(ButtonStyle.Success).setDisabled(!registered),
+    new ButtonBuilder().setCustomId(`stopbot_${userId}_${slotNum}`).setLabel("⏹ Stop").setStyle(ButtonStyle.Danger).setDisabled(!online),
   );
 }
 
-function botControlRow2(userId) {
-  const registered = getUser(userId)?.registered ?? false;
+function slotControlRow2(userId, slotNum) {
+  const registered = getSlot(userId, slotNum)?.registered ?? false;
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`restart_${userId}`).setLabel("Restart Bot").setStyle(ButtonStyle.Secondary).setEmoji("🔄").setDisabled(!registered),
-    new ButtonBuilder().setCustomId(`status_${userId}`).setLabel("Status").setStyle(ButtonStyle.Secondary).setEmoji("📊"),
-    new ButtonBuilder().setCustomId(`delete_${userId}`).setLabel("Delete").setStyle(ButtonStyle.Danger).setEmoji("🗑"),
+    new ButtonBuilder().setCustomId(`restartbot_${userId}_${slotNum}`).setLabel("🔄 Restart").setStyle(ButtonStyle.Secondary).setDisabled(!registered),
+    new ButtonBuilder().setCustomId(`statusbot_${userId}_${slotNum}`).setLabel("📊 Status").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`delslot_${userId}_${slotNum}`).setLabel("🗑 Delete Slot").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`myslots_${userId}`).setLabel("◀ Back").setStyle(ButtonStyle.Secondary),
   );
 }
 
-function mainPanelRow() {
+function openPanelRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("open_panel").setLabel("PANEL").setStyle(ButtonStyle.Primary).setEmoji("🎮"),
   );
@@ -241,207 +298,255 @@ export async function startDiscordBot() {
   const clientId = process.env.DISCORD_CLIENT_ID;
   const guildId = process.env.DISCORD_GUILD_ID;
 
-  if (!token || !clientId) {
-    console.log("[Discord] Missing DISCORD_BOT_TOKEN or DISCORD_CLIENT_ID — Discord bot disabled.");
-    return;
-  }
+  if (!token || !clientId) { console.log("[Discord] Missing token/clientId — disabled."); return; }
 
-  // Register slash commands
   const rest = new REST().setToken(token);
   const commands = [
     new SlashCommandBuilder().setName("panel").setDescription("Open the AFK Bot Control Panel").toJSON(),
-    new SlashCommandBuilder().setName("status").setDescription("Check your bot status").toJSON(),
-    new SlashCommandBuilder().setName("start").setDescription("Start your AFK bot").toJSON(),
-    new SlashCommandBuilder().setName("stop").setDescription("Stop your AFK bot").toJSON(),
-    new SlashCommandBuilder().setName("restart").setDescription("Restart your AFK bot").toJSON(),
-    new SlashCommandBuilder().setName("admin_list").setDescription("[Admin] List all active bots").toJSON(),
+    new SlashCommandBuilder().setName("slots").setDescription("See all your bot slots").toJSON(),
+    new SlashCommandBuilder().setName("start").setDescription("Start a bot slot").addIntegerOption(o => o.setName("slot").setDescription("Slot number").setRequired(true)).toJSON(),
+    new SlashCommandBuilder().setName("stop").setDescription("Stop a bot slot").addIntegerOption(o => o.setName("slot").setDescription("Slot number").setRequired(true)).toJSON(),
+    new SlashCommandBuilder().setName("restart").setDescription("Restart a bot slot").addIntegerOption(o => o.setName("slot").setDescription("Slot number").setRequired(true)).toJSON(),
+    new SlashCommandBuilder().setName("status").setDescription("Status of a bot slot").addIntegerOption(o => o.setName("slot").setDescription("Slot number (default: all)").setRequired(false)).toJSON(),
+    new SlashCommandBuilder().setName("startall").setDescription("Start ALL your registered slots").toJSON(),
+    new SlashCommandBuilder().setName("stopall").setDescription("Stop ALL your running slots").toJSON(),
+    new SlashCommandBuilder().setName("admin_list").setDescription("[Admin] List all bots").toJSON(),
   ];
 
   try {
-    if (guildId) {
-      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
-      console.log("[Discord] Guild slash commands registered.");
-    } else {
-      await rest.put(Routes.applicationCommands(clientId), { body: commands });
-      console.log("[Discord] Global slash commands registered.");
-    }
-  } catch (e) { console.error("[Discord] Command registration failed:", e.message); }
+    if (guildId) { await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands }); console.log("[Discord] Guild commands registered."); }
+    else { await rest.put(Routes.applicationCommands(clientId), { body: commands }); console.log("[Discord] Global commands registered."); }
+  } catch (e) { console.error("[Discord] Command reg failed:", e.message); }
 
-  const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-  });
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
   client.once(Events.ClientReady, () => {
     console.log(`[Discord] Logged in as ${client.user.tag}`);
-    client.user.setActivity("Minecraft AFK Bots", { type: ActivityType.Watching });
-    // Auto-start saved bots
-    for (const [uid, d] of Object.entries(db)) {
-      if (d?.registered && d?.host) {
-        console.log(`[Discord] Auto-starting bot for user ${uid}`);
-        setTimeout(() => startUserBot(uid, client), 4000 + Math.random() * 3000);
+    client.user.setActivity("100 Minecraft Bots", { type: ActivityType.Watching });
+    // Auto-start saved slots
+    for (const [uid, slots] of Object.entries(db)) {
+      for (const [num, d] of Object.entries(slots)) {
+        if (d?.registered && d?.host) {
+          console.log(`[Discord] Auto-starting slot ${num} for user ${uid}`);
+          setTimeout(() => startBot(uid, num, client), 4000 + Math.random() * 5000);
+        }
       }
     }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
-    // ── Slash Commands ──
+
+    // ── SLASH COMMANDS ──────────────────────────────────────────────────────────
     if (interaction.isChatInputCommand()) {
       const userId = interaction.user.id;
       const cmd = interaction.commandName;
 
       if (cmd === "panel") {
-        await interaction.reply({
-          embeds: [buildMainEmbed()],
-          components: [mainPanelRow()],
-        });
+        await interaction.reply({ embeds: [buildMainEmbed()], components: [openPanelRow()] });
         return;
       }
 
-      if (cmd === "status") {
-        await interaction.reply({ embeds: [buildUserEmbed(userId)], ephemeral: true });
+      if (cmd === "slots") {
+        const rows = [mainRow(userId)];
+        const menu = slotsSelectMenu(userId);
+        if (menu) rows.push(menu);
+        await interaction.reply({ embeds: [buildSlotsEmbed(userId)], components: rows, ephemeral: true });
         return;
       }
 
       if (cmd === "start") {
-        const d = getUser(userId);
-        if (!d?.registered) { await interaction.reply({ content: "❌ You haven't registered yet! Use `/panel` first.", ephemeral: true }); return; }
-        startUserBot(userId, client);
-        await interaction.reply({ content: "🚀 Bot is starting...", ephemeral: true });
+        const num = interaction.options.getInteger("slot");
+        const d = getSlot(userId, num);
+        if (!d?.registered) { await interaction.reply({ content: `❌ Slot ${num} not registered! Use \`/panel\` to register.`, ephemeral: true }); return; }
+        startBot(userId, num, client);
+        await interaction.reply({ content: `🚀 Slot **${num}** (${d.username}) starting...`, ephemeral: true });
         return;
       }
 
       if (cmd === "stop") {
-        if (!isOnline(userId)) { await interaction.reply({ content: "❌ Your bot is not online.", ephemeral: true }); return; }
-        stopUserBot(userId);
-        await interaction.reply({ content: "⏹ Bot stopped.", ephemeral: true });
+        const num = interaction.options.getInteger("slot");
+        stopBot(userId, num);
+        await interaction.reply({ content: `⏹ Slot **${num}** stopped.`, ephemeral: true });
         return;
       }
 
       if (cmd === "restart") {
-        const d = getUser(userId);
-        if (!d?.registered) { await interaction.reply({ content: "❌ You haven't registered yet!", ephemeral: true }); return; }
-        restartUserBot(userId, client);
-        await interaction.reply({ content: "🔄 Bot restarting...", ephemeral: true });
+        const num = interaction.options.getInteger("slot");
+        const d = getSlot(userId, num);
+        if (!d?.registered) { await interaction.reply({ content: `❌ Slot ${num} not found!`, ephemeral: true }); return; }
+        restartBot(userId, num, client);
+        await interaction.reply({ content: `🔄 Slot **${num}** restarting...`, ephemeral: true });
+        return;
+      }
+
+      if (cmd === "status") {
+        const num = interaction.options.getInteger("slot");
+        if (num) {
+          await interaction.reply({ embeds: [buildSlotEmbed(userId, num)], ephemeral: true });
+        } else {
+          const rows = [mainRow(userId)];
+          const menu = slotsSelectMenu(userId);
+          if (menu) rows.push(menu);
+          await interaction.reply({ embeds: [buildSlotsEmbed(userId)], components: rows, ephemeral: true });
+        }
+        return;
+      }
+
+      if (cmd === "startall") {
+        const slots = getUserSlots(userId);
+        let count = 0;
+        for (const [num, d] of Object.entries(slots)) {
+          if (d?.registered && d?.host) { startBot(userId, num, client); count++; await new Promise(r => setTimeout(r, 500)); }
+        }
+        await interaction.reply({ content: `🚀 Starting **${count}** slots...`, ephemeral: true });
+        return;
+      }
+
+      if (cmd === "stopall") {
+        const slots = getUserSlots(userId);
+        let count = 0;
+        for (const [num] of Object.entries(slots)) { stopBot(userId, num); count++; }
+        await interaction.reply({ content: `⏹ Stopped **${count}** slots.`, ephemeral: true });
         return;
       }
 
       if (cmd === "admin_list") {
-        const adminId = process.env.DISCORD_ADMIN_ID;
-        if (adminId && interaction.user.id !== adminId) { await interaction.reply({ content: "❌ Admin only.", ephemeral: true }); return; }
+        if (ADMIN_ID && userId !== ADMIN_ID) { await interaction.reply({ content: "❌ Admin only.", ephemeral: true }); return; }
         const lines = [];
-        for (const [uid, d] of Object.entries(db)) {
-          const online = isOnline(uid);
-          const recon = isReconnecting(uid);
-          lines.push(`<@${uid}> — **${d.username || "?"}** @ ${d.host || "?"} — ${online ? "🟢" : recon ? "🟡" : "🔴"}`);
+        for (const [uid, slots] of Object.entries(db)) {
+          for (const [num, d] of Object.entries(slots)) {
+            const online = isOnline(uid, num);
+            const recon = isRecon(uid, num);
+            lines.push(`${online ? "🟢" : recon ? "🟡" : "🔴"} <@${uid}> Slot ${num} — **${d.username}** @ ${d.host}`);
+          }
         }
-        const embed = new EmbedBuilder().setTitle("📋 All Registered Users").setDescription(lines.length ? lines.join("\n") : "None registered").setColor(0x5865F2);
+        const embed = new EmbedBuilder().setTitle("📋 All Bot Slots").setDescription(lines.length ? lines.join("\n") : "No slots registered").setColor(0x5865F2);
         await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
     }
 
-    // ── Buttons ──
+    // ── BUTTONS ──────────────────────────────────────────────────────────────────
     if (interaction.isButton()) {
-      const customId = interaction.customId;
+      const id = interaction.customId;
 
-      // Main panel button
-      if (customId === "open_panel") {
+      if (id === "open_panel") {
         const userId = interaction.user.id;
-        await interaction.reply({
-          embeds: [buildUserEmbed(userId)],
-          components: [botControlRow(userId), botControlRow2(userId)],
-          ephemeral: true,
-        });
+        const rows = [mainRow(userId)];
+        const menu = slotsSelectMenu(userId);
+        if (menu) rows.push(menu);
+        await interaction.reply({ embeds: [buildSlotsEmbed(userId)], components: rows, ephemeral: true });
         return;
       }
 
-      // Parse userId from button custom ID
-      const [action, ...rest2] = customId.split("_");
-      const targetUserId = rest2.join("_");
+      // Parse: action_userId_slotNum  OR  action_userId
+      const parts = id.split("_");
+      const action = parts[0];
+      const targetUserId = parts[1];
+      const slotNum = parts[2] ?? null;
 
-      // Security: only the owner can use their buttons
-      if (targetUserId !== interaction.user.id) {
-        await interaction.reply({ content: "❌ This panel belongs to someone else!", ephemeral: true });
-        return;
-      }
+      if (targetUserId !== interaction.user.id) { await interaction.reply({ content: "❌ Not your panel!", ephemeral: true }); return; }
       const userId = targetUserId;
 
-      if (action === "register") {
-        const d = getUser(userId);
-        const modal = new ModalBuilder().setCustomId(`modal_register_${userId}`).setTitle(`Register Your MC Bot`);
-        const hostInput = new TextInputBuilder().setCustomId("host").setLabel("Server IP / Host").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("play.example.com").setValue(d?.host ?? "");
-        const portInput = new TextInputBuilder().setCustomId("port").setLabel("Server Port").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("25565").setValue(String(d?.port ?? 25565));
-        const verInput = new TextInputBuilder().setCustomId("version").setLabel("Minecraft Version").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("1.21").setValue(d?.version ?? "1.21");
-        const userInput = new TextInputBuilder().setCustomId("username").setLabel("Bot Username").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("AFKBot").setValue(d?.username ?? "");
-        const passInput = new TextInputBuilder().setCustomId("password").setLabel("AuthMe Password (leave blank if not needed)").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Leave blank if server doesn't use AuthMe");
+      if (action === "myslots") {
+        const rows = [mainRow(userId)];
+        const menu = slotsSelectMenu(userId);
+        if (menu) rows.push(menu);
+        await interaction.update({ embeds: [buildSlotsEmbed(userId)], components: rows });
+        return;
+      }
+
+      if (action === "newslot") {
+        const count = getUserSlotCount(userId);
+        if (count >= MAX_SLOTS_PER_USER) { await interaction.reply({ content: `❌ You've reached the max of **${MAX_SLOTS_PER_USER}** slots!`, ephemeral: true }); return; }
+        const newNum = getNextSlotNum(userId);
+        setSlot(userId, newNum, { registered: false });
+        const rows = [slotControlRow1(userId, newNum), slotControlRow2(userId, newNum)];
+        await interaction.update({ embeds: [buildSlotEmbed(userId, newNum)], components: rows });
+        return;
+      }
+
+      if (action === "reg") {
+        const d = getSlot(userId, slotNum) ?? {};
+        const modal = new ModalBuilder().setCustomId(`modal_${userId}_${slotNum}`).setTitle(`Register Slot ${slotNum}`);
         modal.addComponents(
-          new ActionRowBuilder().addComponents(hostInput),
-          new ActionRowBuilder().addComponents(portInput),
-          new ActionRowBuilder().addComponents(verInput),
-          new ActionRowBuilder().addComponents(userInput),
-          new ActionRowBuilder().addComponents(passInput),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("host").setLabel("Server IP / Host").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("play.example.com").setValue(d?.host ?? "")),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("25565").setValue(String(d?.port ?? 25565))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("version").setLabel("Minecraft Version").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("1.21").setValue(d?.version ?? "1.21")),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("username").setLabel("Bot Username").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("AFKBot").setValue(d?.username ?? "")),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("password").setLabel("AuthMe Password (blank if not needed)").setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder("Leave blank if not needed")),
         );
         await interaction.showModal(modal);
         return;
       }
 
-      if (action === "start") {
-        const d = getUser(userId);
+      if (action === "startbot") {
+        const d = getSlot(userId, slotNum);
         if (!d?.registered) { await interaction.reply({ content: "❌ Register first!", ephemeral: true }); return; }
-        startUserBot(userId, client);
-        await interaction.update({ embeds: [buildUserEmbed(userId)], components: [botControlRow(userId), botControlRow2(userId)] });
-        await interaction.followUp({ content: "🚀 Bot is starting! You'll get a DM when it joins.", ephemeral: true });
+        startBot(userId, slotNum, client);
+        await interaction.update({ embeds: [buildSlotEmbed(userId, slotNum)], components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)] });
+        await interaction.followUp({ content: `🚀 Slot ${slotNum} starting! You'll get a DM when it joins.`, ephemeral: true });
         return;
       }
 
-      if (action === "stop") {
-        stopUserBot(userId);
-        await interaction.update({ embeds: [buildUserEmbed(userId)], components: [botControlRow(userId), botControlRow2(userId)] });
-        await interaction.followUp({ content: "⏹ Bot stopped.", ephemeral: true });
+      if (action === "stopbot") {
+        stopBot(userId, slotNum);
+        await interaction.update({ embeds: [buildSlotEmbed(userId, slotNum)], components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)] });
         return;
       }
 
-      if (action === "restart") {
-        restartUserBot(userId, client);
-        await interaction.update({ embeds: [buildUserEmbed(userId)], components: [botControlRow(userId), botControlRow2(userId)] });
-        await interaction.followUp({ content: "🔄 Restarting...", ephemeral: true });
+      if (action === "restartbot") {
+        restartBot(userId, slotNum, client);
+        await interaction.update({ embeds: [buildSlotEmbed(userId, slotNum)], components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)] });
+        await interaction.followUp({ content: `🔄 Slot ${slotNum} restarting...`, ephemeral: true });
         return;
       }
 
-      if (action === "status") {
-        try { await interaction.update({ embeds: [buildUserEmbed(userId)], components: [botControlRow(userId), botControlRow2(userId)] }); } catch {}
+      if (action === "statusbot") {
+        await interaction.update({ embeds: [buildSlotEmbed(userId, slotNum)], components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)] });
         return;
       }
 
-      if (action === "delete") {
-        stopUserBot(userId);
-        deleteUser(userId);
-        const embed = new EmbedBuilder().setTitle("🗑 Bot Deleted").setDescription("Your bot slot has been deleted. Use the panel to register again.").setColor(0xed4245);
-        await interaction.update({ embeds: [embed], components: [] });
+      if (action === "delslot") {
+        stopBot(userId, slotNum);
+        deleteSlot(userId, slotNum);
+        const rows = [mainRow(userId)];
+        const menu = slotsSelectMenu(userId);
+        if (menu) rows.push(menu);
+        await interaction.update({ embeds: [buildSlotsEmbed(userId)], components: rows });
+        await interaction.followUp({ content: `🗑 Slot ${slotNum} deleted.`, ephemeral: true });
         return;
       }
     }
 
-    // ── Modals ──
-    if (interaction.type === InteractionType.ModalSubmit) {
-      if (interaction.customId.startsWith("modal_register_")) {
-        const userId = interaction.customId.replace("modal_register_", "");
+    // ── SELECT MENU ──────────────────────────────────────────────────────────────
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId.startsWith("slotmenu_")) {
+        const userId = interaction.customId.replace("slotmenu_", "");
         if (userId !== interaction.user.id) { await interaction.reply({ content: "❌ Not your panel!", ephemeral: true }); return; }
+        const value = interaction.values[0]; // selectslot_userId_slotNum
+        const slotNum = value.split("_")[2];
+        await interaction.update({ embeds: [buildSlotEmbed(userId, slotNum)], components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)] });
+        return;
+      }
+    }
 
+    // ── MODALS ───────────────────────────────────────────────────────────────────
+    if (interaction.type === InteractionType.ModalSubmit) {
+      if (interaction.customId.startsWith("modal_")) {
+        const [, userId, slotNum] = interaction.customId.split("_");
+        if (userId !== interaction.user.id) { await interaction.reply({ content: "❌ Not your panel!", ephemeral: true }); return; }
         const host = interaction.fields.getTextInputValue("host").trim();
         const port = parseInt(interaction.fields.getTextInputValue("port").trim() || "25565");
         const version = interaction.fields.getTextInputValue("version").trim() || "1.21";
         const username = interaction.fields.getTextInputValue("username").trim();
         const password = interaction.fields.getTextInputValue("password").trim() || null;
-
-        if (!host || !username) { await interaction.reply({ content: "❌ Host and Username are required!", ephemeral: true }); return; }
-
-        setUser(userId, { host, port, version, username, password, registered: true, discordTag: interaction.user.tag });
-
+        if (!host || !username) { await interaction.reply({ content: "❌ Host and Username required!", ephemeral: true }); return; }
+        setSlot(userId, slotNum, { host, port, version, username, password, registered: true, discordTag: interaction.user.tag });
         await interaction.reply({
-          content: `✅ **Registered!** Your bot is set up.\n\n🖥 Server: \`${host}:${port}\`\n👤 Username: \`${username}\`\n📌 Version: \`${version}\`\n\nClick **Start Bot** to launch!`,
-          embeds: [buildUserEmbed(userId)],
-          components: [botControlRow(userId), botControlRow2(userId)],
+          content: `✅ **Slot ${slotNum} Registered!**\n\n🖥 \`${host}:${port}\` | 👤 \`${username}\` | 📌 \`${version}\`\n\nClick **▶ Start** to launch your bot!`,
+          embeds: [buildSlotEmbed(userId, slotNum)],
+          components: [slotControlRow1(userId, slotNum), slotControlRow2(userId, slotNum)],
           ephemeral: true,
         });
         return;
